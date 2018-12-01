@@ -846,7 +846,7 @@ static unsigned         dump_memory64_info(struct dump_context* dc)
     MINIDUMP_MEMORY64_LIST          mdMem64List;
     MINIDUMP_MEMORY_DESCRIPTOR64    mdMem64;
     RVA                             rva_base;
-    unsigned                        i, sz;
+    unsigned                        i, pos, len, sz;
     char                            tmp[1024];
 
     fetch_memory64_info(dc);
