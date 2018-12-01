@@ -509,6 +509,9 @@ struct dump_context
     struct dump_memory*                 mem;
     unsigned                            num_mem;
     unsigned                            alloc_mem;
+    struct dump_memory*                 mem64;
+    unsigned                            num_mem64;
+    unsigned                            alloc_mem64;
     /* callback information */
     MINIDUMP_CALLBACK_INFORMATION*      cb;
 };

@@ -294,6 +294,11 @@ static BOOL fetch_macho_module_info_cb(const WCHAR* name, unsigned long base,
     return TRUE;
 }
 
+static void fetch_memory64_info(struct dump_context* dc)
+{
+
+}
+
 static void fetch_modules_info(struct dump_context* dc)
 {
     EnumerateLoadedModulesW64(dc->hProcess, fetch_pe_module_info_cb, dc);
@@ -831,6 +836,55 @@ static unsigned         dump_memory_info(struct dump_context* dc)
     return sz;
 }
 
+/******************************************************************
+ *		dump_memory64_info
+ *
+ * dumps information about the memory of the process (virtual memory)
+ */
+static unsigned         dump_memory64_info(struct dump_context* dc)
+{
+    MINIDUMP_MEMORY64_LIST          mdMem64List;
+    MINIDUMP_MEMORY_DESCRIPTOR64    mdMem64;
+    RVA                             base_rva;
+    unsigned                        i, sz;
+    char                            tmp[1024];
+
+    fetch_memory64_info(dc);
+
+    sz = sizeof(mdMem64List.NumberOfMemoryRanges) +
+            sizeof(mdMem64List.BaseRva) +
+            dc->num_mem64 * sizeof(mdMem64);
+
+    mdMem64List.NumberOfMemoryRanges = dc->num_mem64;    
+    mdMem64List.BaseRva = dc->rva + sz;           
+
+    append(dc, &mdMem64List.NumberOfMemoryRanges,
+           sizeof(mdMem64List.NumberOfMemoryRanges));
+    append(dc, &mdMem64List.BaseRva,
+            sizeof(mdMem64List.BaseRva));
+    
+    rva_base = dc->rva;
+    dc->rva += sz;
+    
+    for (i = 0; i < dc->num_mem64; i++)
+    {
+        mdMem64.StartOfMemoryRange = dc->mem64[i].base;
+        mdMem64.DataSize = dc->mem64[i].size;
+        SetFilePointer(dc->hFile, dc->rva, NULL, FILE_BEGIN);
+        for (pos = 0; pos < dc->mem64[i].size; pos += sizeof(tmp))
+        {
+            len = min(dc->mem64[i].size - pos, sizeof(tmp));
+            if (ReadProcessMemory(dc->hProcess, 
+                                  (void*)(DWORD_PTR)(dc->mem64[i].base + pos),
+                                  tmp, len, NULL))
+                WriteFile(dc->hFile, tmp, len, &written, NULL);
+        }
+        dc->rva += mdMem64.DataSize;
+        writeat(dc, rva_base + i * sizeof(mdMem64), &mdMem64, sizeof(mdMem64));
+    }
+    return sz;
+}
+
 static unsigned         dump_misc_info(struct dump_context* dc)
 {
     MINIDUMP_MISC_INFO  mmi;
@@ -876,6 +930,9 @@ BOOL WINAPI MiniDumpWriteDump(HANDLE hProcess, DWORD pid, HANDLE hFile,
     dc.mem = NULL;
     dc.num_mem = 0;
     dc.alloc_mem = 0;
+    dc.mem64 = NULL;
+    dc.num_mem64 = 0;
+    dc.alloc_mem64 = 0;
     dc.rva = 0;
 
     if (!fetch_process_info(&dc)) return FALSE;
@@ -883,15 +940,14 @@ BOOL WINAPI MiniDumpWriteDump(HANDLE hProcess, DWORD pid, HANDLE hFile,
 
     /* 1) init */
     nStreams = 6 + (ExceptionParam ? 1 : 0) +
-        (UserStreamParam ? UserStreamParam->UserStreamCount : 0);
+        (UserStreamParam ? UserStreamParam->UserStreamCount : 0) +
+        (DumpType & MiniDumpWithFullMemory ? 1 : 0);
 
     /* pad the directory size to a multiple of 4 for alignment purposes */
     nStreams = (nStreams + 3) & ~3;
 
     if (DumpType & MiniDumpWithDataSegs)
         FIXME("NIY MiniDumpWithDataSegs\n");
-    if (DumpType & MiniDumpWithFullMemory)
-        FIXME("NIY MiniDumpWithFullMemory\n");
     if (DumpType & MiniDumpWithHandleData)
         FIXME("NIY MiniDumpWithHandleData\n");
     if (DumpType & MiniDumpFilterMemory)
@@ -977,12 +1033,23 @@ BOOL WINAPI MiniDumpWriteDump(HANDLE hProcess, DWORD pid, HANDLE hFile,
         }
     }
 
+    /* 3.4) write full memory */
+    if (DumpType & MiniDumpWithFullMemory)
+    {
+        mdDir.StreamType = Memory64ListStream;
+        mdDir.Location.Rva = dc.rva;
+        mdDir.Location.DataSize = dump_memory64_info(&dc);
+        writeat(&dc, mdHead.StreamDirectoryRva + idx_stream++ * sizeof(mdDir),
+                &mdDir, sizeof(mdDir));
+    }
+
     /* fill the remaining directory entries with 0's (unused stream types) */
     /* NOTE: this should always come last in the dump! */
     for (i = idx_stream; i < nStreams; i++)
         writeat(&dc, mdHead.StreamDirectoryRva + i * sizeof(emptyDir), &emptyDir, sizeof(emptyDir));
 
     HeapFree(GetProcessHeap(), 0, dc.mem);
+    HeapFree(GetProcessHeap(), 0, dc.mem64);
     HeapFree(GetProcessHeap(), 0, dc.modules);
     HeapFree(GetProcessHeap(), 0, dc.threads);
 
