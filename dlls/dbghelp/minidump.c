@@ -296,7 +296,19 @@ static BOOL fetch_macho_module_info_cb(const WCHAR* name, unsigned long base,
 
 static void fetch_memory64_info(struct dump_context* dc)
 {
+    VOID*                       addr;
+    MEMORY_BASIC_INFORMATION    mbi;
 
+    addr = 0;
+    while (VirtualQueryEx(dc->hProcess, addr, &mbi, sizeof(mbi)) != 0)
+    {
+        minidump_add_memory64_block(dc, mbi.BaseAddress, mbi.RegionSize);
+        
+        if ((addr + mbi.RegionSize) < addr)
+            break;
+        
+        addr = mbi.BaseAddress + mbi.RegionSize;
+    }
 }
 
 static void fetch_modules_info(struct dump_context* dc)
@@ -362,6 +374,28 @@ void minidump_add_memory_block(struct dump_context* dc, ULONG64 base, ULONG size
         dc->num_mem++;
     }
     else dc->num_mem = dc->alloc_mem = 0;
+}
+
+void minidump_add_memory64_block(struct dump_context* dc, ULONG64 base, ULONG size)
+{
+    if (!dc->mem64)
+    {
+        dc->alloc_mem64 = 32;
+        dc->mem64 = HeapAlloc(GetProcessHeap(), 0, dc->alloc_mem64 * sizeof(*dc->mem64));
+    }
+    else if (dc->num_mem64 >= dc->alloc_mem64)
+    {
+        dc->alloc_mem64 *= 2;
+        dc->mem64 = HeapReAlloc(GetProcessHeap(), 0, dc->mem64,
+                                dc->alloc_mem64 * sizeof(*dc->mem64));
+    }
+    if (dc->mem64)
+    {
+        dc->mem64[dc->num_mem64].base = base;
+        dc->mem64[dc->num_mem64].size = size;
+        dc->num_mem64++;
+    }
+    else dc->num_mem64 = dc->alloc_mem64 = 0;
 }
 
 /******************************************************************

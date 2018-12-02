@@ -471,6 +471,12 @@ struct dump_memory
     ULONG                               rva;
 };
 
+struct dump_memory64
+{
+    ULONG64                             base;
+    ULONG                               size;
+}
+
 struct dump_module
 {
     unsigned                            is_elf;
@@ -509,7 +515,7 @@ struct dump_context
     struct dump_memory*                 mem;
     unsigned                            num_mem;
     unsigned                            alloc_mem;
-    struct dump_memory*                 mem64;
+    struct dump_memory64*               mem64;
     unsigned                            num_mem64;
     unsigned                            alloc_mem64;
     /* callback information */
