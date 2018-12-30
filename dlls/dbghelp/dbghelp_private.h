@@ -474,8 +474,8 @@ struct dump_memory
 struct dump_memory64
 {
     ULONG64                             base;
-    ULONG                               size;
-}
+    ULONG64                             size;
+};
 
 struct dump_module
 {

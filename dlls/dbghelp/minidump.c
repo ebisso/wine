@@ -294,20 +294,46 @@ static BOOL fetch_macho_module_info_cb(const WCHAR* name, unsigned long base,
     return TRUE;
 }
 
+void minidump_add_memory64_block(struct dump_context* dc, ULONG64 base, ULONG64 size)
+{
+    if (!dc->mem64)
+    {
+        dc->alloc_mem64 = 32;
+        dc->mem64 = HeapAlloc(GetProcessHeap(), 0, dc->alloc_mem64 * sizeof(*dc->mem64));
+    }
+    else if (dc->num_mem64 >= dc->alloc_mem64)
+    {
+        dc->alloc_mem64 *= 2;
+        dc->mem64 = HeapReAlloc(GetProcessHeap(), 0, dc->mem64,
+                                dc->alloc_mem64 * sizeof(*dc->mem64));
+    }
+    if (dc->mem64)
+    {
+        dc->mem64[dc->num_mem64].base = base;
+        dc->mem64[dc->num_mem64].size = size;
+        dc->num_mem64++;
+    }
+    else dc->num_mem64 = dc->alloc_mem64 = 0;
+}
+
 static void fetch_memory64_info(struct dump_context* dc)
 {
-    VOID*                       addr;
+    ULONG_PTR                   addr;
     MEMORY_BASIC_INFORMATION    mbi;
 
     addr = 0;
-    while (VirtualQueryEx(dc->hProcess, addr, &mbi, sizeof(mbi)) != 0)
+    while (VirtualQueryEx(dc->hProcess, (LPCVOID)addr, &mbi, sizeof(mbi)) != 0)
     {
-        minidump_add_memory64_block(dc, mbi.BaseAddress, mbi.RegionSize);
-        
+        /* Memory regions with state MEM_COMMIT will be added to the dump */
+        if (mbi.State == MEM_COMMIT)
+        {
+            minidump_add_memory64_block(dc, (ULONG_PTR)mbi.BaseAddress, mbi.RegionSize);
+        }
+
         if ((addr + mbi.RegionSize) < addr)
             break;
         
-        addr = mbi.BaseAddress + mbi.RegionSize;
+        addr = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
     }
 }
 
@@ -374,28 +400,6 @@ void minidump_add_memory_block(struct dump_context* dc, ULONG64 base, ULONG size
         dc->num_mem++;
     }
     else dc->num_mem = dc->alloc_mem = 0;
-}
-
-void minidump_add_memory64_block(struct dump_context* dc, ULONG64 base, ULONG size)
-{
-    if (!dc->mem64)
-    {
-        dc->alloc_mem64 = 32;
-        dc->mem64 = HeapAlloc(GetProcessHeap(), 0, dc->alloc_mem64 * sizeof(*dc->mem64));
-    }
-    else if (dc->num_mem64 >= dc->alloc_mem64)
-    {
-        dc->alloc_mem64 *= 2;
-        dc->mem64 = HeapReAlloc(GetProcessHeap(), 0, dc->mem64,
-                                dc->alloc_mem64 * sizeof(*dc->mem64));
-    }
-    if (dc->mem64)
-    {
-        dc->mem64[dc->num_mem64].base = base;
-        dc->mem64[dc->num_mem64].size = size;
-        dc->num_mem64++;
-    }
-    else dc->num_mem64 = dc->alloc_mem64 = 0;
 }
 
 /******************************************************************
@@ -880,11 +884,11 @@ static unsigned         dump_memory64_info(struct dump_context* dc)
     MINIDUMP_MEMORY64_LIST          mdMem64List;
     MINIDUMP_MEMORY_DESCRIPTOR64    mdMem64;
     DWORD                           written;
-    unsigned                        i, pos, len, sz;
+    unsigned                        i, len, sz;
     RVA                             rva_base;
     char                            tmp[1024];
-
-    fetch_memory64_info(dc);
+    ULONG64                         pos;
+    LARGE_INTEGER                   filepos;
 
     sz = sizeof(mdMem64List.NumberOfMemoryRanges) +
             sizeof(mdMem64List.BaseRva) +
@@ -896,27 +900,31 @@ static unsigned         dump_memory64_info(struct dump_context* dc)
     append(dc, &mdMem64List.NumberOfMemoryRanges,
            sizeof(mdMem64List.NumberOfMemoryRanges));
     append(dc, &mdMem64List.BaseRva,
-            sizeof(mdMem64List.BaseRva));
+           sizeof(mdMem64List.BaseRva));
     
     rva_base = dc->rva;
-    dc->rva += sz;
+    dc->rva += dc->num_mem64 * sizeof(mdMem64);
     
+    /* dc->rva is not updated past this point. The end of the dump
+     * is just the full memory data. */
+    filepos.QuadPart = dc->rva;
     for (i = 0; i < dc->num_mem64; i++)
     {
         mdMem64.StartOfMemoryRange = dc->mem64[i].base;
         mdMem64.DataSize = dc->mem64[i].size;
-        SetFilePointer(dc->hFile, dc->rva, NULL, FILE_BEGIN);
+        SetFilePointerEx(dc->hFile, filepos, NULL, FILE_BEGIN);
         for (pos = 0; pos < dc->mem64[i].size; pos += sizeof(tmp))
         {
             len = min(dc->mem64[i].size - pos, sizeof(tmp));
             if (ReadProcessMemory(dc->hProcess, 
-                                  (void*)(DWORD_PTR)(dc->mem64[i].base + pos),
+                                  (void*)(ULONG_PTR)(dc->mem64[i].base + pos),
                                   tmp, len, NULL))
                 WriteFile(dc->hFile, tmp, len, &written, NULL);
         }
-        dc->rva += mdMem64.DataSize;
+        filepos.QuadPart += mdMem64.DataSize;
         writeat(dc, rva_base + i * sizeof(mdMem64), &mdMem64, sizeof(mdMem64));
     }
+    
     return sz;
 }
 
@@ -975,8 +983,7 @@ BOOL WINAPI MiniDumpWriteDump(HANDLE hProcess, DWORD pid, HANDLE hFile,
 
     /* 1) init */
     nStreams = 6 + (ExceptionParam ? 1 : 0) +
-        (UserStreamParam ? UserStreamParam->UserStreamCount : 0) +
-        (DumpType & MiniDumpWithFullMemory ? 1 : 0);
+        (UserStreamParam ? UserStreamParam->UserStreamCount : 0);
 
     /* pad the directory size to a multiple of 4 for alignment purposes */
     nStreams = (nStreams + 3) & ~3;
@@ -1031,11 +1038,15 @@ BOOL WINAPI MiniDumpWriteDump(HANDLE hProcess, DWORD pid, HANDLE hFile,
     writeat(&dc, mdHead.StreamDirectoryRva + idx_stream++ * sizeof(mdDir),
             &mdDir, sizeof(mdDir));
 
-    mdDir.StreamType = MemoryListStream;
-    mdDir.Location.Rva = dc.rva;
-    mdDir.Location.DataSize = dump_memory_info(&dc);
-    writeat(&dc, mdHead.StreamDirectoryRva + idx_stream++ * sizeof(mdDir),
-            &mdDir, sizeof(mdDir));
+    
+    if (!(DumpType & MiniDumpWithFullMemory))
+    {
+        mdDir.StreamType = MemoryListStream;
+        mdDir.Location.Rva = dc.rva;
+        mdDir.Location.DataSize = dump_memory_info(&dc);
+        writeat(&dc, mdHead.StreamDirectoryRva + idx_stream++ * sizeof(mdDir),
+                &mdDir, sizeof(mdDir));
+    }
 
     mdDir.StreamType = MiscInfoStream;
     mdDir.Location.Rva = dc.rva;
@@ -1068,9 +1079,11 @@ BOOL WINAPI MiniDumpWriteDump(HANDLE hProcess, DWORD pid, HANDLE hFile,
         }
     }
 
-    /* 3.4) write full memory */
+    /* 3.4) write full memory (if requested) */
     if (DumpType & MiniDumpWithFullMemory)
     {
+        fetch_memory64_info(&dc);
+
         mdDir.StreamType = Memory64ListStream;
         mdDir.Location.Rva = dc.rva;
         mdDir.Location.DataSize = dump_memory64_info(&dc);
